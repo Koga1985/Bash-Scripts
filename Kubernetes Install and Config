@@ -1,0 +1,67 @@
+# Built by: Smith, Dewain #TheBeardedEngineer
+# Script: Kubernetes Basic Deploy and Config
+# Purpose: Install and configure Kubernetes on a Linux system
+# Note: Read through and modify variables as needed.
+
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Variables
+POD_NETWORK_CIDR="192.168.0.0/16" # Replace with your desired Pod network CIDR
+FLANNEL_YAML="https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml"
+KUBERNETES_REPO="http://apt.kubernetes.io/"
+KUBERNETES_RELEASE="kubernetes-xenial"
+
+# Functions
+function log() {
+  echo -e "[INFO] $1"
+}
+
+function error_exit() {
+  echo -e "[ERROR] $1" >&2
+  exit 1
+}
+
+# Update the package list
+log "Updating package list..."
+sudo apt-get update || error_exit "Failed to update package list."
+
+# Install Docker (required by Kubernetes)
+log "Installing Docker..."
+sudo apt-get install -y docker.io || error_exit "Failed to install Docker."
+
+# Enable and start Docker service
+log "Enabling and starting Docker service..."
+sudo systemctl enable docker || error_exit "Failed to enable Docker service."
+sudo systemctl start docker || error_exit "Failed to start Docker service."
+
+# Install Kubernetes components
+log "Installing Kubernetes components..."
+sudo apt-get install -y apt-transport-https curl || error_exit "Failed to install prerequisites for Kubernetes."
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add - || error_exit "Failed to add Kubernetes GPG key."
+echo "deb $KUBERNETES_REPO $KUBERNETES_RELEASE main" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update || error_exit "Failed to update package list after adding Kubernetes repository."
+sudo apt-get install -y kubelet kubeadm kubectl || error_exit "Failed to install Kubernetes components."
+
+# Initialize the Kubernetes cluster
+log "Initializing Kubernetes cluster with Pod network CIDR: $POD_NETWORK_CIDR..."
+sudo kubeadm init --pod-network-cidr=$POD_NETWORK_CIDR || error_exit "Failed to initialize Kubernetes cluster."
+
+# Configure kubectl for the current user
+log "Configuring kubectl for the current user..."
+mkdir -p $HOME/.kube || error_exit "Failed to create .kube directory."
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config || error_exit "Failed to copy admin.conf to .kube/config."
+sudo chown $(id -u):$(id -g) $HOME/.kube/config || error_exit "Failed to set ownership of .kube/config."
+
+# Install a Pod network add-on (flannel)
+log "Installing Flannel Pod network add-on..."
+kubectl apply -f $FLANNEL_YAML || error_exit "Failed to apply Flannel YAML configuration."
+
+# Wait for all nodes to be in the Ready state
+log "Waiting for nodes to be Ready..."
+kubectl get nodes
+kubectl wait --for=condition=Ready nodes --all --timeout=300s || error_exit "Nodes did not reach Ready state within the timeout period."
+
+log "Kubernetes installation and configuration complete. Your cluster is ready."
