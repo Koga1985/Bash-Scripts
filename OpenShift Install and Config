@@ -1,0 +1,64 @@
+# Built by: Smith, Dewain #TheBeardedEngineer
+# Script: OpenShift Basic Deploy and Config
+# Purpose: Install and configure OpenShift client tools and set up a basic project
+# Note: Read through and modify variables as needed.
+
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Variables
+OCP_VERSION="4.9.0"               # Change to the desired OpenShift version
+INSTALL_DIR="/opt/openshift"      # Change to the desired installation directory
+PROJECT_NAME="myproject"          # Replace with your desired project name
+SAMPLE_APP="openshift/deployment-example" # Replace with your application image
+
+# Functions
+function log() {
+  echo -e "[INFO] $1"
+}
+
+function error_exit() {
+  echo -e "[ERROR] $1" >&2
+  exit 1
+}
+
+# Check if the oc tool is installed
+log "Checking for OpenShift CLI (oc)..."
+if ! command -v oc &>/dev/null; then
+  error_exit "OpenShift CLI (oc) not found. Please install it before running this script."
+fi
+
+# Create installation directory
+log "Creating installation directory at $INSTALL_DIR..."
+sudo mkdir -p $INSTALL_DIR || error_exit "Failed to create directory $INSTALL_DIR."
+sudo chown $(whoami):$(whoami) $INSTALL_DIR || error_exit "Failed to set ownership of $INSTALL_DIR."
+
+# Download and extract OpenShift client
+log "Downloading OpenShift client (version: $OCP_VERSION)..."
+wget -q https://mirror.openshift.com/pub/openshift-v4/clients/ocp/$OCP_VERSION/openshift-client-linux-$OCP_VERSION.tar.gz -O /tmp/oc.tar.gz || error_exit "Failed to download OpenShift client."
+log "Extracting OpenShift client to $INSTALL_DIR..."
+tar -zxvf /tmp/oc.tar.gz -C $INSTALL_DIR || error_exit "Failed to extract OpenShift client."
+export PATH=$PATH:$INSTALL_DIR
+log "OpenShift client installed successfully."
+
+# Log in as cluster admin
+log "Logging in as cluster admin..."
+if ! oc login -u system:admin &>/dev/null; then
+  error_exit "Failed to log in as system:admin. Ensure your OpenShift cluster is running and accessible."
+fi
+
+# Create a new project
+log "Creating new project: $PROJECT_NAME..."
+if ! oc new-project $PROJECT_NAME &>/dev/null; then
+  error_exit "Failed to create project $PROJECT_NAME. Ensure you have the required permissions."
+fi
+
+# Deploy a sample application
+log "Deploying sample application: $SAMPLE_APP..."
+if ! oc new-app $SAMPLE_APP &>/dev/null; then
+  error_exit "Failed to deploy sample application $SAMPLE_APP. Ensure the image exists and is accessible."
+fi
+
+log "OpenShift installation and configuration completed successfully."
