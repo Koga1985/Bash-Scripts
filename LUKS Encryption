@@ -1,0 +1,67 @@
+# Built by: Smith, Dewain #TheBeardedEngineer
+# Script: LUKS Disk Encryption
+# Purpose: Encrypt a block device using LUKS and mount it securely
+# Note: Read through and modify variables as needed.
+
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Functions
+function log() {
+  echo -e "[INFO] $1"
+}
+
+function error_exit() {
+  echo -e "[ERROR] $1" >&2
+  exit 1
+}
+
+# Prompt for the block device to encrypt
+read -p "Enter the block device to encrypt (e.g., /dev/sdX): " blockDevice
+
+# Ensure the block device exists
+if [ ! -b "$blockDevice" ]; then
+  error_exit "Block device $blockDevice does not exist or is not a valid block device."
+fi
+
+# Confirm user wants to proceed
+read -p "This will erase all data on $blockDevice. Are you sure you want to continue? (yes/no): " confirmation
+if [[ "$confirmation" != "yes" ]]; then
+  error_exit "Operation aborted by user."
+fi
+
+# Prompt for a passphrase
+read -s -p "Enter the passphrase for encryption: " passphrase
+echo    # Move to the next line after reading the passphrase
+read -s -p "Confirm the passphrase: " confirmPassphrase
+echo    # Move to the next line
+
+if [[ "$passphrase" != "$confirmPassphrase" ]]; then
+  error_exit "Passphrases do not match. Aborting."
+fi
+
+# Encrypt the block device with LUKS
+log "Encrypting $blockDevice with LUKS..."
+echo -n "$passphrase" | cryptsetup luksFormat --type luks2 "$blockDevice" - || error_exit "Failed to encrypt $blockDevice."
+
+# Open the LUKS device
+log "Opening the encrypted device..."
+echo -n "$passphrase" | cryptsetup open "$blockDevice" luks || error_exit "Failed to open the encrypted device."
+
+# Format the encrypted device (e.g., with an ext4 filesystem)
+log "Formatting the encrypted device with ext4 filesystem..."
+mkfs.ext4 /dev/mapper/luks || error_exit "Failed to format the encrypted device."
+
+# Mount the encrypted device
+MOUNT_DIR="/mnt/encrypted"
+log "Mounting the encrypted device at $MOUNT_DIR..."
+sudo mkdir -p "$MOUNT_DIR" || error_exit "Failed to create mount directory $MOUNT_DIR."
+sudo mount /dev/mapper/luks "$MOUNT_DIR" || error_exit "Failed to mount the encrypted device."
+
+# Success message
+log "LUKS encryption has been successfully applied to $blockDevice and mounted at $MOUNT_DIR."
+log "To unmount and close the encrypted device, use the following commands:"
+log "  sudo umount $MOUNT_DIR"
+log "  sudo cryptsetup close luks"
