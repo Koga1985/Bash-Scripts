@@ -1,0 +1,51 @@
+# Built by: Smith, Dewain #TheBeardedEngineer
+# Script: VeeamKasten Basic Deploy and Config
+# Purpose: Deploy and configure Kasten K10 on Kubernetes
+# Note: Read through and modify variables as needed
+
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Variables
+HELM_REPO_NAME="kasten"
+HELM_REPO_URL="https://charts.kasten.io/"
+HELM_RELEASE_NAME="k10"
+NAMESPACE="kasten-io"
+SERVICE_NAME="gateway"
+LOCAL_PORT=8080
+REMOTE_PORT=8000
+
+# Functions
+function log() {
+  echo -e "[INFO] $1"
+}
+
+function error_exit() {
+  echo -e "[ERROR] $1" >&2
+  exit 1
+}
+
+# Add the Kasten Helm repository
+log "Adding the Kasten Helm repository..."
+helm repo add $HELM_REPO_NAME $HELM_REPO_URL || error_exit "Failed to add Helm repository."
+
+# Update the Helm repositories
+log "Updating Helm repositories..."
+helm repo update || error_exit "Failed to update Helm repositories."
+
+# Install Kasten K10
+log "Installing Kasten K10..."
+helm install $HELM_RELEASE_NAME $HELM_REPO_NAME/$HELM_RELEASE_NAME --namespace $NAMESPACE --create-namespace || error_exit "Failed to install Kasten K10."
+
+# Wait for Kasten K10 controller pod to be ready
+log "Waiting for Kasten K10 controller pod to be ready..."
+kubectl wait --for=condition=Ready pod -l app.kubernetes.io/component=controller --timeout=300s -n $NAMESPACE || error_exit "Kasten K10 pods failed to become ready within the timeout period."
+
+# Port-forward Kasten K10 dashboard to localhost
+log "Port-forwarding Kasten K10 dashboard to localhost on port $LOCAL_PORT..."
+kubectl port-forward svc/$SERVICE_NAME -n $NAMESPACE $LOCAL_PORT:$REMOTE_PORT || error_exit "Failed to port-forward the Kasten K10 dashboard."
+
+# Display the Kasten K10 dashboard URL
+log "Kasten K10 dashboard is now available at http://localhost:$LOCAL_PORT/k10/#/"
