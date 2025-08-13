@@ -21,8 +21,12 @@
 
 # Exit immediately if a command exits with a non-zero status,
 # if an undefined variable is used, or if any pipeline returns a non-zero status.
+
 set -euo pipefail
 IFS=$'\n\t'
+
+# Trap unexpected errors
+trap 'error_exit "Unexpected error occurred on line $LINENO."' ERR
 
 #----------------------------------------------
 # Variables
@@ -39,16 +43,14 @@ REMOTE_PORT=8000                                  # Remote port exposed by the S
 # Logging Functions
 #----------------------------------------------
 # log: Outputs informational messages with a timestamp.
-function log() {
-  local message="$1"
-  echo -e "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $message"
+log() {
+    echo -e "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $*"
 }
 
 # error_exit: Outputs an error message and exits the script.
-function error_exit() {
-  local message="$1"
-  echo -e "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $message" >&2
-  exit 1
+error_exit() {
+    echo -e "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $*" >&2
+    exit 1
 }
 
 #----------------------------------------------
@@ -65,9 +67,13 @@ fi
 #----------------------------------------------
 # 1. Add the Kasten Helm Repository
 #----------------------------------------------
-log "Adding the Kasten Helm repository..."
-if ! helm repo add "$HELM_REPO_NAME" "$HELM_REPO_URL"; then
-    error_exit "Failed to add Helm repository."
+if helm repo list | grep -q "^${HELM_REPO_NAME}\b"; then
+    log "Helm repo '${HELM_REPO_NAME}' already exists. Skipping add."
+else
+    log "Adding the Kasten Helm repository..."
+    if ! helm repo add "$HELM_REPO_NAME" "$HELM_REPO_URL"; then
+            error_exit "Failed to add Helm repository."
+    fi
 fi
 
 #----------------------------------------------
@@ -79,11 +85,18 @@ if ! helm repo update; then
 fi
 
 #----------------------------------------------
-# 3. Install Kasten K10
+# 3. Install or Upgrade Kasten K10
 #----------------------------------------------
-log "Installing Kasten K10..."
-if ! helm install "$HELM_RELEASE_NAME" "$HELM_REPO_NAME/$HELM_RELEASE_NAME" --namespace "$NAMESPACE" --create-namespace; then
-    error_exit "Failed to install Kasten K10."
+if helm status "$HELM_RELEASE_NAME" -n "$NAMESPACE" &>/dev/null; then
+    log "Helm release '$HELM_RELEASE_NAME' already exists in namespace '$NAMESPACE'. Upgrading instead of installing."
+    if ! helm upgrade "$HELM_RELEASE_NAME" "$HELM_REPO_NAME/$HELM_RELEASE_NAME" --namespace "$NAMESPACE"; then
+        error_exit "Failed to upgrade Kasten K10."
+    fi
+else
+    log "Installing Kasten K10..."
+    if ! helm install "$HELM_RELEASE_NAME" "$HELM_REPO_NAME/$HELM_RELEASE_NAME" --namespace "$NAMESPACE" --create-namespace; then
+        error_exit "Failed to install Kasten K10."
+    fi
 fi
 
 #----------------------------------------------
@@ -98,13 +111,25 @@ fi
 # 5. Port-Forward the Kasten K10 Dashboard to Localhost
 #----------------------------------------------
 log "Port-forwarding Kasten K10 dashboard to localhost on port $LOCAL_PORT..."
+if ! kubectl get svc "$SERVICE_NAME" -n "$NAMESPACE" &>/dev/null; then
+    error_exit "Service '$SERVICE_NAME' not found in namespace '$NAMESPACE'."
+fi
 if ! kubectl port-forward svc/"$SERVICE_NAME" -n "$NAMESPACE" "$LOCAL_PORT":"$REMOTE_PORT"; then
-    error_exit "Failed to port-forward the Kasten K10 dashboard."
+        error_exit "Failed to port-forward the Kasten K10 dashboard."
 fi
 
 #----------------------------------------------
 # 6. Display Dashboard URL
 #----------------------------------------------
 log "Kasten K10 dashboard is now available at http://localhost:$LOCAL_PORT/k10/#/"
+
+#----------------------------------------------
+# 7. Summary
+#----------------------------------------------
+log "Kasten K10 deployment script completed successfully."
+log "Helm repo: $HELM_REPO_NAME ($HELM_REPO_URL)"
+log "Helm release: $HELM_RELEASE_NAME"
+log "Namespace: $NAMESPACE"
+log "Dashboard: http://localhost:$LOCAL_PORT/k10/#/"
 
 # End of Script

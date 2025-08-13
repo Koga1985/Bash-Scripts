@@ -29,8 +29,12 @@
 #===============================================================================
 
 # Exit immediately if a command fails, if an undefined variable is used, or if any command in a pipeline fails.
+
 set -euo pipefail
 IFS=$'\n\t'
+
+# Trap unexpected errors
+trap 'error_exit "Unexpected error occurred on line $LINENO."' ERR
 
 #----------------------------------------------
 # Pre-flight Checks
@@ -77,15 +81,26 @@ LOG_FILE="/var/log/san_stig.log"  # Logging file path (adjust as needed)
 #----------------------------------------------
 # 1. Prompt for Block Device and Validate
 #----------------------------------------------
+
 read -p "Enter the block device to encrypt (e.g., /dev/sdX): " BLOCK_DEVICE
-if [ ! -b "$BLOCK_DEVICE" ]; then
+if [[ ! -b "$BLOCK_DEVICE" ]]; then
   error_exit "Block device $BLOCK_DEVICE does not exist or is not a valid block device."
 fi
 log "Block device $BLOCK_DEVICE found."
 
+# Check if device is already encrypted
+if cryptsetup isLuks "$BLOCK_DEVICE" &>/dev/null; then
+  log "Block device $BLOCK_DEVICE is already encrypted with LUKS."
+  read -p "Do you want to re-encrypt and erase all data? (yes/no): " reencrypt
+  if [[ "$reencrypt" != "yes" ]]; then
+    error_exit "Operation aborted by user."
+  fi
+fi
+
 #----------------------------------------------
 # 2. Confirmation: Warning about Data Loss
 #----------------------------------------------
+
 read -p "WARNING: This will erase all data on $BLOCK_DEVICE. Are you sure you want to continue? (yes/no): " confirmation
 if [[ "$confirmation" != "yes" ]]; then
   error_exit "Operation aborted by user."
@@ -95,6 +110,7 @@ log "User confirmed to proceed with encryption."
 #----------------------------------------------
 # 3. Prompt for Passphrase and Validation
 #----------------------------------------------
+
 read -s -p "Enter the passphrase for encryption: " passphrase
 echo    # Newline after password input.
 read -s -p "Confirm the passphrase: " confirmPassphrase
@@ -107,46 +123,69 @@ log "Passphrase confirmed."
 #----------------------------------------------
 # 4. Encrypt the Block Device using LUKS
 #----------------------------------------------
+
 log "Encrypting $BLOCK_DEVICE with LUKS..."
 if ! echo -n "$passphrase" | cryptsetup luksFormat --type luks2 "$BLOCK_DEVICE"; then
-    error_exit "Failed to encrypt $BLOCK_DEVICE."
+  error_exit "Failed to encrypt $BLOCK_DEVICE."
 fi
 log "Encryption of $BLOCK_DEVICE completed."
 
 #----------------------------------------------
 # 5. Open the LUKS Encrypted Device
 #----------------------------------------------
+
 log "Opening the encrypted device..."
-if ! echo -n "$passphrase" | cryptsetup open "$BLOCK_DEVICE" luks; then
-    error_exit "Failed to open the encrypted device."
+if [[ -e /dev/mapper/luks ]]; then
+  log "/dev/mapper/luks already exists. Skipping open."
+else
+  if ! echo -n "$passphrase" | cryptsetup open "$BLOCK_DEVICE" luks; then
+      error_exit "Failed to open the encrypted device."
+  fi
+  log "Encrypted device opened successfully."
 fi
-log "Encrypted device opened successfully."
 
 #----------------------------------------------
 # 6. Format the Encrypted Device with ext4 Filesystem
 #----------------------------------------------
+
 log "Formatting the encrypted device (/dev/mapper/luks) with ext4 filesystem..."
-if ! mkfs.ext4 /dev/mapper/luks; then
-    error_exit "Failed to format the encrypted device."
+if blkid /dev/mapper/luks | grep -q ext4; then
+  log "Encrypted device already formatted with ext4. Skipping format."
+else
+  if ! mkfs.ext4 /dev/mapper/luks; then
+      error_exit "Failed to format the encrypted device."
+  fi
+  log "Filesystem formatted successfully."
 fi
-log "Filesystem formatted successfully."
 
 #----------------------------------------------
 # 7. Mount the Encrypted Device
 #----------------------------------------------
+
 log "Mounting the encrypted device at $MOUNT_DIR..."
-if ! mkdir -p "$MOUNT_DIR"; then
-    error_exit "Failed to create mount directory $MOUNT_DIR."
+if [[ ! -d "$MOUNT_DIR" ]]; then
+  if ! mkdir -p "$MOUNT_DIR"; then
+      error_exit "Failed to create mount directory $MOUNT_DIR."
+  fi
 fi
-if ! mount /dev/mapper/luks "$MOUNT_DIR"; then
-    error_exit "Failed to mount the encrypted device."
+if mount | grep -q "$MOUNT_DIR"; then
+  log "Encrypted device already mounted at $MOUNT_DIR."
+else
+  if ! mount /dev/mapper/luks "$MOUNT_DIR"; then
+      error_exit "Failed to mount the encrypted device."
+  fi
+  log "Encrypted device mounted at $MOUNT_DIR."
 fi
-log "Encrypted device mounted at $MOUNT_DIR."
 
 #----------------------------------------------
 # Final Instructions and Success Message
 #----------------------------------------------
+
 log "LUKS encryption has been successfully applied to $BLOCK_DEVICE and mounted at $MOUNT_DIR."
-log "To unmount and close the encrypted device, use the following commands:"
-log "  sudo umount $MOUNT_DIR"
-log "  sudo cryptsetup close luks"
+log "Summary:"
+log "- Block device: $BLOCK_DEVICE"
+log "- Mount point: $MOUNT_DIR"
+log "- Mapper device: /dev/mapper/luks"
+log "Next steps:"
+log "- To unmount: sudo umount $MOUNT_DIR"
+log "- To close:   sudo cryptsetup close luks"

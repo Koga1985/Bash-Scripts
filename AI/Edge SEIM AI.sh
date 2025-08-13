@@ -1,5 +1,18 @@
+
 #!/bin/bash
-set -e
+set -euo pipefail
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+# Ensure the script is run as root
+if [[ $EUID -ne 0 ]]; then
+  log "ERROR: This script must be run as root. Use sudo or run as root."
+  exit 1
+fi
+
+log "Starting deployment of Edge AI for SIEM..."
 
 # Ensure the script is run as root
 if [[ $EUID -ne 0 ]]; then
@@ -23,82 +36,114 @@ LOGROTATE_CONF="/etc/logrotate.d/edge-ai" # logrotate configuration file
 ##############################
 # Pre-Tasks: Ensure /opt directory exists
 ##############################
-mkdir -p /opt
-chmod 0755 /opt
-echo "Ensured /opt directory exists with permissions 0755."
+
+if [[ ! -d /opt ]]; then
+  mkdir -p /opt && chmod 0755 /opt
+  log "Ensured /opt directory exists with permissions 0755."
+else
+  log "/opt directory already exists."
+fi
 
 ##############################
 # Install required system packages
 ##############################
-echo "Updating package cache and installing packages..."
-apt-get update
-apt-get install -y \
+
+log "Updating package cache and installing packages..."
+if ! apt-get update; then
+  log "ERROR: apt-get update failed."
+  exit 2
+fi
+if ! apt-get install -y \
   python3 \
   python3-pip \
   rsyslog \
   logrotate \
   prometheus-node-exporter \
-  nvidia-container-toolkit
+  nvidia-container-toolkit; then
+  log "ERROR: Package installation failed."
+  exit 3
+fi
 
 ##############################
 # Install Python libraries for machine learning
 ##############################
-echo "Installing Python libraries..."
-pip3 install numpy scikit-learn pandas
+
+log "Installing Python libraries..."
+if ! pip3 install numpy scikit-learn pandas; then
+  log "ERROR: Python package installation failed."
+  exit 4
+fi
 
 ##############################
 # Deploy Edge AI detection script
 ##############################
+
 # Assumes the local script file "edge_ai_detection.py" exists in the current directory
 if [[ ! -f "./edge_ai_detection.py" ]]; then
-  echo "Error: edge_ai_detection.py not found in the current directory."
-  exit 1
+  log "ERROR: edge_ai_detection.py not found in the current directory."
+  exit 5
 fi
 
-cp ./edge_ai_detection.py "$EDGE_AI_SCRIPT"
+if ! cp ./edge_ai_detection.py "$EDGE_AI_SCRIPT"; then
+  log "ERROR: Failed to copy edge_ai_detection.py to $EDGE_AI_SCRIPT."
+  exit 6
+fi
 chmod 0755 "$EDGE_AI_SCRIPT"
 chown root:root "$EDGE_AI_SCRIPT"
-echo "Deployed Edge AI detection script to $EDGE_AI_SCRIPT."
+log "Deployed Edge AI detection script to $EDGE_AI_SCRIPT."
 
 ##############################
 # Configure rsyslog to forward logs to centralized SIEM
 ##############################
-cat <<EOF > "$RSYSLOG_CONF"
-*.* @@${LOG_FORWARDING_HOST}:${LOG_FORWARDING_PORT}
-EOF
+
+log "Configuring rsyslog to forward logs to SIEM..."
+echo "*.* @@${LOG_FORWARDING_HOST}:${LOG_FORWARDING_PORT}" | tee "$RSYSLOG_CONF" > /dev/null
 chmod 0644 "$RSYSLOG_CONF"
 chown root:root "$RSYSLOG_CONF"
-systemctl restart rsyslog
-echo "Configured rsyslog to forward logs and restarted rsyslog."
+if ! systemctl restart rsyslog; then
+  log "ERROR: Failed to restart rsyslog."
+  exit 7
+fi
+log "Configured rsyslog to forward logs and restarted rsyslog."
 
 ##############################
 # Configure logrotate for Edge AI logs
 ##############################
-cat <<EOF > "$LOGROTATE_CONF"
+
+log "Configuring logrotate for Edge AI logs..."
+cat <<EOF | tee "$LOGROTATE_CONF" > /dev/null
 /var/log/edge-ai/*.log {
-    daily
-    rotate ${RETENTION_DAYS}
-    compress
-    missingok
-    notifempty
+  daily
+  rotate ${RETENTION_DAYS}
+  compress
+  missingok
+  notifempty
 }
 EOF
 chmod 0644 "$LOGROTATE_CONF"
 chown root:root "$LOGROTATE_CONF"
-echo "Configured logrotate for Edge AI logs."
+log "Configured logrotate for Edge AI logs."
 
 ##############################
 # Enable and start Prometheus Node Exporter
 ##############################
-systemctl enable prometheus-node-exporter
-systemctl start prometheus-node-exporter
-echo "Enabled and started Prometheus Node Exporter."
+
+log "Enabling and starting Prometheus Node Exporter..."
+if ! systemctl is-enabled prometheus-node-exporter &>/dev/null; then
+  systemctl enable prometheus-node-exporter
+fi
+if ! systemctl is-active prometheus-node-exporter &>/dev/null; then
+  systemctl start prometheus-node-exporter
+fi
+log "Prometheus Node Exporter is enabled and running."
 
 ##############################
 # Create systemd service for Edge AI script
 ##############################
+
+log "Creating systemd service for Edge AI script..."
 SYSTEMD_SERVICE_FILE="/etc/systemd/system/${EDGE_AI_SERVICE}.service"
-cat <<EOF > "$SYSTEMD_SERVICE_FILE"
+cat <<EOF | tee "$SYSTEMD_SERVICE_FILE" > /dev/null
 [Unit]
 Description=Edge AI Log Analyzer
 After=network.target
@@ -115,13 +160,20 @@ EOF
 chmod 0644 "$SYSTEMD_SERVICE_FILE"
 chown root:root "$SYSTEMD_SERVICE_FILE"
 systemctl daemon-reload
-echo "Created systemd service for Edge AI and reloaded systemd."
+log "Created systemd service for Edge AI and reloaded systemd."
 
 ##############################
 # Enable and start Edge AI systemd service
 ##############################
-systemctl enable "${EDGE_AI_SERVICE}.service"
-systemctl start "${EDGE_AI_SERVICE}.service"
-echo "Enabled and started the Edge AI service."
 
-echo "Deployment complete."
+log "Enabling and starting Edge AI systemd service..."
+if ! systemctl is-enabled "${EDGE_AI_SERVICE}.service" &>/dev/null; then
+  systemctl enable "${EDGE_AI_SERVICE}.service"
+fi
+if ! systemctl is-active "${EDGE_AI_SERVICE}.service" &>/dev/null; then
+  systemctl start "${EDGE_AI_SERVICE}.service"
+fi
+log "Edge AI service is enabled and running."
+
+
+log "Deployment complete."

@@ -28,7 +28,26 @@
 #===============================================================================
 
 # Exit immediately if a command exits with a non-zero status.
+
 set -e
+
+# Trap unexpected errors
+trap 'log "ERROR" "Unexpected error occurred on line $LINENO."; exit 1' ERR
+
+# Ensure script is run as root
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root. Use sudo or run as root." >&2
+    exit 1
+fi
+
+# Check for required tools
+REQUIRED_TOOLS=(esxcli vim-cmd passwd)
+for tool in "${REQUIRED_TOOLS[@]}"; do
+    if ! command -v "$tool" &>/dev/null; then
+        log "ERROR" "Required tool '$tool' not found. Please install it before running this script."
+        exit 1
+    fi
+done
 
 #--------------------------------------
 # Logging Function
@@ -44,6 +63,7 @@ log() {
 #--------------------------------------
 # Note: Replace 'your_password' with a strong, secure password.
 # Using a here-document to supply password input to the passwd command.
+
 log "INFO" "Setting root password..."
 cat <<EOF | passwd root
 your_password
@@ -54,8 +74,8 @@ log "INFO" "Root password set successfully."
 #--------------------------------------
 # 2. Disable Unnecessary iSCSI Services
 #--------------------------------------
+
 log "INFO" "Removing unnecessary iSCSI VIBs..."
-# These commands remove specific iSCSI VIBs to reduce the attack surface.
 esxcli software vib remove -n iscsi
 esxcli software vib remove -n iscsi-vmk
 esxcli software vib remove -n iscsi-tcp
@@ -86,6 +106,7 @@ log "INFO" "Shell and SSH timeouts configured."
 # 5. Configure NTP Settings
 #--------------------------------------
 # Replace "time.nist.gov" if a different NTP server is preferred.
+
 ntp_server="time.nist.gov"
 log "INFO" "Configuring NTP settings to use server: $ntp_server..."
 esxcli system ntp set --servers "$ntp_server"
@@ -113,6 +134,7 @@ log "INFO" "ESXi Shell and SSH have been disabled."
 # 8. Configure Syslog Server
 #--------------------------------------
 # Replace 'your_syslog_server' with the address of your syslog server.
+
 syslog_server="udp://your_syslog_server:514"
 log "INFO" "Configuring syslog server: $syslog_server..."
 esxcli system syslog config set --loghost="$syslog_server"
@@ -122,4 +144,17 @@ log "INFO" "Syslog server configured and syslog settings reloaded."
 #--------------------------------------
 # Final Message
 #--------------------------------------
+
 log "INFO" "ESXi STIG configurations applied. Reboot the host for changes to take effect."
+log "INFO" "Summary:"
+log "INFO" "- Root password set."
+log "INFO" "- iSCSI VIBs removed."
+log "INFO" "- IPMI SEL cleared."
+log "INFO" "- Shell/SSH timeouts configured."
+log "INFO" "- NTP configured: $ntp_server"
+log "INFO" "- Lockdown mode enabled."
+log "INFO" "- ESXi Shell/SSH disabled."
+log "INFO" "- Syslog server: $syslog_server"
+log "INFO" "Next steps:"
+log "INFO" "- Reboot the host."
+log "INFO" "- Validate security settings and compliance."

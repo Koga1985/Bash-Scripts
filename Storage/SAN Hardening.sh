@@ -25,7 +25,17 @@
 
 # Exit immediately if a command exits with a non-zero status, undefined variables are errors,
 # and in case of any error in a pipeline.
+
 set -euo pipefail
+
+# Trap unexpected errors
+trap 'error_exit "Unexpected error occurred on line $LINENO."' ERR
+
+# Ensure script is run as root
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root. Use sudo or run as root." >&2
+    exit 1
+fi
 
 # Variables
 SAN_NAME="MySAN"              # Replace with the name of your SAN
@@ -57,7 +67,16 @@ function error_exit() {
 #----------------------------------------------
 # Begin SAN STIG Configuration
 #----------------------------------------------
+
 log "Starting SAN STIG Configuration for $SAN_NAME..."
+
+# Check for required tools (customize as needed)
+REQUIRED_TOOLS=(date)
+for tool in "${REQUIRED_TOOLS[@]}"; do
+    if ! command -v "$tool" &>/dev/null; then
+        error_exit "Required tool '$tool' not found. Please install it before running this script."
+    fi
+done
 
 # Step 1: Update SAN firmware and software
 log "Step 1: Updating SAN firmware and software..."
@@ -107,7 +126,15 @@ log "Step 8: Periodically reviewing and updating SAN security policies..."
 # Uncomment and update the following line when ready:
 # review_policies || error_exit "Failed to review and update security policies."
 
+
 log "SAN STIG configurations successfully applied to $SAN_NAME."
+log "Summary:"
+log "- SAN Name: $SAN_NAME"
+log "- Log file: $LOG_FILE"
+log "Next steps:"
+log "- Review $LOG_FILE for details and errors."
+log "- Validate SAN security settings and compliance."
+log "- Schedule regular reviews and audits."
 
 # Additional Recommendations
 log "Additional recommendations:"
