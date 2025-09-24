@@ -1,218 +1,267 @@
-#!/bin/bash
-#===============================================================================
-# Script Name: install_kubernetes.sh
-# Description:
-#   This script installs and configures a Kubernetes cluster on an Ubuntu system.
-#   It performs the following actions:
-#     1. Updates the package list.
-#     2. Installs Docker.
-#     3. Enables and starts the Docker service.
-#     4. Installs Kubernetes components (kubelet, kubeadm, kubectl) using the 
-#        official Kubernetes repository.
-#     5. Initializes a Kubernetes cluster with a specified Pod network CIDR.
-#     6. Configures kubectl for the current user.
-#     7. Installs the Flannel Pod network add-on.
-#     8. Waits for all nodes to reach the Ready state.
+#!/usr/bin/env bash
 #
-# Prerequisites:
-#   - Must be run as root or with sudo privileges.
-#   - The system must be running Ubuntu (or compatible distribution).
-#   - Internet connectivity is required to download packages and resources.
+# Kubernetes Bootstrap Script (Enterprise-ready)
+# - Idempotent, documented, and safe by default (dry-run).
+# - Use --apply to perform changes. Supports --verbose and --yes.
 #
-# Disclaimer:
-#   This script is provided "as is" without warranty of any kind. Use at your own risk.
-#   Test in a development environment before running in production.
-#
-# Author: Your Name or Organization
-# Date: 2025-04-14
-# Version: 1.0
-#===============================================================================
-
-# Exit immediately if a command exits with a non-zero status, if any variable is unset,
-# or if any command in a pipeline fails.
+# Note: This is intended for single-node or small lab clusters. For production,
+# use your infrastructure automation (Terraform/Ansible) and follow your provider's best
+# practices for bootstrapping control planes, HA, storage, and networking.
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# Trap unexpected errors
-trap 'error_exit "Unexpected error occurred on line $LINENO."' ERR
+################################################################################
+# Configuration (tune these values for your environment)
+################################################################################
 
-# Ensure script is run as root
-if [[ $EUID -ne 0 ]]; then
-    echo "This script must be run as root. Use sudo or run as root." >&2
-    exit 1
-fi
+# Operational flags
+DRY_RUN=true
+VERBOSE=false
+FORCE=false
 
-#----------------------------------------------
-# Global Variables
-#----------------------------------------------
-POD_NETWORK_CIDR="192.168.0.0/16"                # Pod network CIDR (adjust as necessary)
+# Kubernetes settings
+POD_NETWORK_CIDR="192.168.0.0/16"
 FLANNEL_YAML="https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml"
-KUBERNETES_REPO="http://apt.kubernetes.io/"
+KUBERNETES_REPO="https://apt.kubernetes.io/"
 KUBERNETES_RELEASE="kubernetes-xenial"
+BACKUP_DIR="/var/tmp/k8s-backup-$(date +%Y%m%d%H%M%S)"
 LOG_FILE="/var/log/k8s_install.log"
 
-#----------------------------------------------
-# Logging Functions
-#----------------------------------------------
-# log: Outputs info messages with timestamp.
-function log() {
-  local message="$1"
-  echo -e "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $message"
-  echo -e "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $message" >> "$LOG_FILE"
+################################################################################
+# Helper functions
+################################################################################
+
+log() {
+  local level="INFO"
+  if [[ "$1" =~ ^(DEBUG|INFO|WARN|ERROR)$ ]]; then
+    level="$1"; shift
+  fi
+  printf '[%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*"
+  mkdir -p "$(dirname "$LOG_FILE")" || true
+  printf '%s %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-# error_exit: Outputs an error message and terminates the script.
-function error_exit() {
-  local message="$1"
-  echo -e "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $message" >&2
-  echo -e "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $message" >> "$LOG_FILE"
-  exit 1
+debug() { [[ "$VERBOSE" == true ]] && log DEBUG "$*"; }
+
+error_exit() { log ERROR "$*"; exit 1; }
+
+run_cmd() {
+  if [[ "$VERBOSE" == true ]]; then
+    log DEBUG "+ $*"
+  fi
+  if [[ "$DRY_RUN" == true ]]; then
+    log INFO "DRY-RUN: $*"
+  else
+    eval "$*"
+  fi
 }
 
-#----------------------------------------------
-# 1. Update Package List
-#----------------------------------------------
+confirm() {
+  local prompt="$1"
+  if [[ "$FORCE" == true ]]; then
+    return 0
+  fi
+  read -r -p "$prompt [yes/no]: " response
+  if [[ "$response" != "yes" ]]; then
+    return 1
+  fi
+  return 0
+}
 
-log "Updating package list..."
-if ! apt-get update; then
-    error_exit "Failed to update package list."
+backup_file_if_exists() {
+  local src="$1"
+  if [[ -e "$src" ]]; then
+    run_cmd "mkdir -p '$BACKUP_DIR' && cp -a '$src' '$BACKUP_DIR/'"
+    log INFO "Backed up $src -> $BACKUP_DIR/"
+  else
+    debug "No file to backup: $src"
+  fi
+}
+
+################################################################################
+# Pre-flight checks
+################################################################################
+
+trap 'error_exit "Unexpected error on line $LINENO"' ERR
+
+if [[ $EUID -ne 0 ]]; then
+  error_exit "This script must be run as root. Use sudo or run as root."
 fi
 
-#----------------------------------------------
-# 2. Install Docker
-#----------------------------------------------
+REQUIRED_TOOLS=(apt-get curl systemctl)
+for t in "${REQUIRED_TOOLS[@]}"; do
+  if ! command -v "$t" &>/dev/null; then
+    error_exit "Required tool '$t' not found. Install it and retry."
+  fi
+done
+
+################################################################################
+# CLI args
+################################################################################
+
+usage() {
+  cat <<-USAGE
+Usage: $0 [--apply] [--yes] [--verbose] [--pod-network-cidr CIDR] [--flannel-yaml URL]
+
+Defaults to dry-run. Options:
+  --apply                 Apply changes (disable dry-run)
+  --yes, -y               Skip confirmations
+  --verbose, -v           Enable verbose debug output
+  --pod-network-cidr CIDR Override default pod network CIDR
+  --flannel-yaml URL      Override default Flannel YAML URL
+  --help, -h              Show this help message
+USAGE
+}
+
+while [[ ${#} -gt 0 ]]; do
+  case "$1" in
+    --apply) DRY_RUN=false; shift ;;
+    --yes|-y) FORCE=true; shift ;;
+    --verbose|-v) VERBOSE=true; shift ;;
+    --pod-network-cidr) POD_NETWORK_CIDR="$2"; shift 2 ;;
+    --flannel-yaml) FLANNEL_YAML="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) log WARN "Unknown option: $1"; usage; exit 2 ;;
+  esac
+done
+
+log INFO "Kubernetes bootstrap starting"
+log INFO "Dry-run: $DRY_RUN, Verbose: $VERBOSE, Force: $FORCE"
+
+################################################################################
+# Backup critical files
+################################################################################
+
+log INFO "Preparing backup directory: $BACKUP_DIR"
+run_cmd "mkdir -p '$BACKUP_DIR' && chmod 700 '$BACKUP_DIR'"
+backup_file_if_exists "/etc/apt/sources.list.d/kubernetes.list"
+backup_file_if_exists "/etc/kubernetes/admin.conf"
+
+################################################################################
+# 1) Update package list
+################################################################################
+
+log INFO "Updating package cache"
+run_cmd "apt-get update"
+
+################################################################################
+# 2) Install Docker (if missing)
+################################################################################
 
 if command -v docker &>/dev/null; then
-    log "Docker is already installed. Skipping installation."
+  log INFO "Docker already installed. Skipping."
 else
-    log "Installing Docker..."
-    if ! apt-get install -y docker.io; then
-            error_exit "Failed to install Docker."
-    fi
+  log INFO "Installing Docker (docker.io)"
+  run_cmd "apt-get install -y docker.io"
 fi
 
-#----------------------------------------------
-# 3. Enable and Start Docker Service
-#----------------------------------------------
+################################################################################
+# 3) Enable and start Docker service
+################################################################################
 
-log "Enabling and starting Docker service..."
-if ! systemctl is-enabled docker &>/dev/null; then
-    if ! systemctl enable docker; then
-            error_exit "Failed to enable Docker service."
-    fi
-fi
-if ! systemctl is-active docker &>/dev/null; then
-    if ! systemctl start docker; then
-            error_exit "Failed to start Docker service."
-    fi
-fi
+log INFO "Ensuring Docker service is enabled and running"
+run_cmd "systemctl enable docker || true"
+run_cmd "systemctl start docker || true"
 
-#----------------------------------------------
-# 4. Install Kubernetes Components
-#----------------------------------------------
+################################################################################
+# 4) Install Kubernetes components (kubelet, kubeadm, kubectl)
+################################################################################
 
-log "Installing prerequisites for Kubernetes components (apt-transport-https, curl)..."
-if ! apt-get install -y apt-transport-https curl; then
-        error_exit "Failed to install prerequisites for Kubernetes."
-fi
+log INFO "Installing prerequisites for Kubernetes (apt-transport-https, curl)"
+run_cmd "apt-get install -y apt-transport-https ca-certificates curl"
 
 if ! apt-key list | grep -q "Google Cloud Packages Automatic Signing Key"; then
-    log "Adding Kubernetes GPG key..."
-    if ! curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -; then
-            error_exit "Failed to add Kubernetes GPG key."
-    fi
+  log INFO "Adding Kubernetes apt GPG key"
+  run_cmd "curl -fsS https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -"
 else
-    log "Kubernetes GPG key already present."
+  log INFO "Kubernetes GPG key already present"
 fi
 
 if [[ ! -f /etc/apt/sources.list.d/kubernetes.list ]]; then
-    log "Adding Kubernetes repository..."
-    echo "deb $KUBERNETES_REPO $KUBERNETES_RELEASE main" | tee /etc/apt/sources.list.d/kubernetes.list
+  log INFO "Adding Kubernetes apt repository"
+  run_cmd "bash -c 'echo \"deb $KUBERNETES_REPO $KUBERNETES_RELEASE main\" > /etc/apt/sources.list.d/kubernetes.list'"
 else
-    log "Kubernetes repository already present."
+  log INFO "Kubernetes repository already configured"
 fi
 
-log "Updating package list after adding Kubernetes repository..."
-if ! apt-get update; then
-        error_exit "Failed to update package list after adding Kubernetes repository."
-fi
+log INFO "Updating apt cache after adding Kubernetes repo"
+run_cmd "apt-get update"
 
 if command -v kubelet &>/dev/null && command -v kubeadm &>/dev/null && command -v kubectl &>/dev/null; then
-    log "Kubernetes components already installed. Skipping installation."
+  log INFO "Kubernetes components already installed. Skipping package installation."
 else
-    log "Installing kubelet, kubeadm, and kubectl..."
-    if ! apt-get install -y kubelet kubeadm kubectl; then
-            error_exit "Failed to install Kubernetes components."
-    fi
+  log INFO "Installing kubelet, kubeadm, kubectl"
+  run_cmd "apt-get install -y kubelet kubeadm kubectl"
 fi
 
-#----------------------------------------------
-# 5. Initialize Kubernetes Cluster
-#----------------------------------------------
+################################################################################
+# 5) Initialize Kubernetes cluster
+################################################################################
 
-log "Initializing Kubernetes cluster with Pod network CIDR: $POD_NETWORK_CIDR..."
 if [[ ! -f /etc/kubernetes/admin.conf ]]; then
-    if ! kubeadm init --pod-network-cidr="$POD_NETWORK_CIDR"; then
-            error_exit "Failed to initialize Kubernetes cluster."
-    fi
+  log INFO "Initializing Kubernetes control plane with pod network CIDR: $POD_NETWORK_CIDR"
+  if [[ "$DRY_RUN" == true ]]; then
+    log INFO "DRY-RUN: kubeadm init --pod-network-cidr=$POD_NETWORK_CIDR"
+  else
+    run_cmd "kubeadm init --pod-network-cidr='$POD_NETWORK_CIDR'"
+  fi
 else
-    log "Kubernetes cluster already initialized. Skipping init."
+  log INFO "Kubernetes appears already initialized (admin.conf present). Skipping init."
 fi
 
-#----------------------------------------------
-# 6. Configure kubectl for the Current User
-#----------------------------------------------
+################################################################################
+# 6) Configure kubectl for current user
+################################################################################
 
-log "Configuring kubectl for the current user..."
 if [[ ! -f "$HOME/.kube/config" ]]; then
-    if ! mkdir -p "$HOME/.kube"; then
-            error_exit "Failed to create .kube directory."
-    fi
-    if ! cp -i /etc/kubernetes/admin.conf "$HOME/.kube/config"; then
-            error_exit "Failed to copy admin.conf to .kube/config."
-    fi
-    if ! chown $(id -u):$(id -g) "$HOME/.kube/config"; then
-            error_exit "Failed to set ownership of .kube/config."
-    fi
+  log INFO "Configuring kubectl for the current user"
+  run_cmd "mkdir -p '$HOME/.kube'"
+  run_cmd "cp -i /etc/kubernetes/admin.conf '$HOME/.kube/config'"
+  run_cmd "chown $(id -u):$(id -g) '$HOME/.kube/config'"
 else
-    log "kubectl already configured for current user."
+  log INFO "kubectl already configured for the current user"
 fi
 
-#----------------------------------------------
-# 7. Install Flannel Pod Network Add-On
-#----------------------------------------------
+################################################################################
+# 7) Install Flannel network add-on
+################################################################################
 
-log "Installing Flannel Pod network add-on using YAML from $FLANNEL_YAML..."
-if ! kubectl get pods -n kube-system | grep -q flannel; then
-    if ! kubectl apply -f "$FLANNEL_YAML"; then
-            error_exit "Failed to apply Flannel YAML configuration."
-    fi
+log INFO "Ensuring Flannel pod network add-on is applied: $FLANNEL_YAML"
+if kubectl get pods -n kube-system 2>/dev/null | grep -q flannel; then
+  log INFO "Flannel already appears installed. Skipping."
 else
-    log "Flannel Pod network already installed."
+  run_cmd "kubectl apply -f '$FLANNEL_YAML'"
 fi
 
-#----------------------------------------------
-# 8. Wait for All Nodes to Become Ready
-#----------------------------------------------
+################################################################################
+# 8) Wait for nodes to become Ready
+################################################################################
 
-log "Waiting for all Kubernetes nodes to be Ready (timeout: 300 seconds)..."
-kubectl get nodes
-if ! kubectl wait --for=condition=Ready nodes --all --timeout=300s; then
-    error_exit "Nodes did not reach Ready state within the timeout period."
+log INFO "Waiting for nodes to become Ready (timeout: 300s)"
+run_cmd "kubectl get nodes || true"
+if [[ "$DRY_RUN" == true ]]; then
+  log INFO "DRY-RUN: kubectl wait --for=condition=Ready nodes --all --timeout=300s"
+else
+  run_cmd "kubectl wait --for=condition=Ready nodes --all --timeout=300s"
 fi
 
-#----------------------------------------------
-# 9. Final Notification
-#----------------------------------------------
+################################################################################
+# Final summary / next steps
+################################################################################
 
-log "Kubernetes installation and configuration complete. Your cluster is now ready."
-log "Summary:"
-log "Docker installed and running."
-log "Kubernetes components installed."
-log "Cluster initialized with Pod network CIDR: $POD_NETWORK_CIDR."
-log "Flannel Pod network installed."
-log "All nodes are Ready."
-log "Next steps:"
-log "- Use 'kubectl get nodes' to verify cluster status."
-log "- Deploy workloads to your cluster."
+log INFO "Kubernetes bootstrap completed (or simulated)."
+log INFO "Summary:"
+log INFO " - Pod network CIDR: $POD_NETWORK_CIDR"
+log INFO " - Flannel YAML: $FLANNEL_YAML"
+log INFO " - Backup dir: $BACKUP_DIR"
+log INFO " - Log file: $LOG_FILE"
+
+if [[ "$DRY_RUN" == true ]]; then
+  log INFO "Dry-run was enabled. Re-run with --apply to perform the changes."
+fi
+
+log INFO "Next steps:"
+log INFO " - Verify nodes: kubectl get nodes"
+log INFO " - Check pods: kubectl get pods -A"
+log INFO " - Configure storage, ingress, and other cluster services as needed."

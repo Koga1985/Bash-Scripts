@@ -1,191 +1,258 @@
-#!/bin/bash
-#===============================================================================
-# Script Name: encrypt_and_mount.sh
-# Description:
-#   This script encrypts a given block device using LUKS (luks2), formats the 
-#   encrypted device with an ext4 filesystem, and mounts it at a designated location.
-# 
-#   The script performs the following steps:
-#     1. Checks that required utilities (cryptsetup, mkfs.ext4, mount) are installed.
-#     2. Verifies that the script is run as root.
-#     3. Prompts the user for a block device to encrypt and validates its existence.
-#     4. Confirms that the user wants to proceed (warning that all data will be erased).
-#     5. Prompts for a passphrase and confirmation, aborting if they do not match.
-#     6. Encrypts the block device using LUKS with the provided passphrase.
-#     7. Opens the LUKS container to create a mapper device.
-#     8. Formats the newly opened device with an ext4 filesystem.
-#     9. Mounts the encrypted device to a predefined mount directory.
-#    10. Provides instructions to unmount and close the encrypted device.
+#!/usr/bin/env bash
 #
-# Prerequisites:
-#   - This script must be run as root.
-#   - Required utilities: cryptsetup, mkfs.ext4, mount.
-#   - Make sure you have a backup of any important data. All data on the block device
-#     will be erased.
+# LUKS Encrypt & Mount (Enterprise-ready)
+# - Idempotent, documented, and safe by default (dry-run).
+# - Use --apply to make actual changes. Supports --verbose and --yes.
 #
-# Author: Your Name or Organization
-# Date: 2025-04-14
-# Version: 1.1
-#===============================================================================
-
-# Exit immediately if a command fails, if an undefined variable is used, or if any command in a pipeline fails.
+# IMPORTANT:
+# - Running this script WILL ERASE DATA on the chosen block device when applied.
+# - Test in a safe environment before running in production.
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# Trap unexpected errors
-trap 'error_exit "Unexpected error occurred on line $LINENO."' ERR
+################################################################################
+# Defaults and configuration (customize before running when needed)
+################################################################################
 
-#----------------------------------------------
-# Pre-flight Checks
-#----------------------------------------------
+# Operational flags (overridable via CLI)
+DRY_RUN=true
+VERBOSE=false
+FORCE=false
 
-# Ensure the script is running as root.
-if [ "$(id -u)" -ne 0 ]; then
-    echo "[ERROR] This script must be run as root." >&2
-    exit 1
-fi
+# Paths and names
+LOG_FILE="/var/log/luks_encrypt.log"
+BACKUP_DIR="/var/tmp/luks-backup-$(date +%Y%m%d%H%M%S)"
+MOUNT_DIR="/mnt/encrypted"
+MAPPER_NAME="luks"   # /dev/mapper/<MAPPER_NAME>
 
-# Check for required commands.
-for cmd in cryptsetup mkfs.ext4 mount; do
-    if ! command -v "$cmd" &>/dev/null; then
-        echo "[ERROR] Required command '$cmd' not found. Please install it before running this script." >&2
-        exit 1
-    fi
-done
+# Files to back up (fstab/crypttab if used)
+FILES_TO_BACKUP=("/etc/fstab" "/etc/crypttab")
 
-#----------------------------------------------
-# Global Logging Functions
-#----------------------------------------------
-function log() {
-  # Outputs a timestamped info message to stdout and appends to the log file.
-  local message="$1"
-  echo -e "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $message"
+################################################################################
+# Helper functions
+################################################################################
+
+log() {
+  local level="INFO"
+  if [[ "$1" =~ ^(DEBUG|INFO|WARN|ERROR)$ ]]; then
+    level="$1"; shift
+  fi
+  printf '[%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*"
+  mkdir -p "$(dirname "$LOG_FILE")" || true
+  printf '%s %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-function error_exit() {
-  # Outputs a timestamped error message to stderr, logs the error, and exits.
-  local message="$1"
-  echo -e "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $message" >&2
+debug() { [[ "$VERBOSE" == true ]] && log DEBUG "$*"; }
+
+error_exit() {
+  log ERROR "$*"
   exit 1
 }
 
-#----------------------------------------------
-# Variables
-#----------------------------------------------
-# Customize variables as needed
-BLOCK_DEVICE=""             # Will be set based on user input.
-MOUNT_DIR="/mnt/encrypted"  # Mount point for the encrypted device.
-LOG_FILE="/var/log/san_stig.log"  # Logging file path (adjust as needed)
+run_cmd() {
+  if [[ "$VERBOSE" == true ]]; then
+    log DEBUG "+ $*"
+  fi
+  if [[ "$DRY_RUN" == true ]]; then
+    log INFO "DRY-RUN: $*"
+  else
+    eval "$*"
+  fi
+}
 
-#----------------------------------------------
-# 1. Prompt for Block Device and Validate
-#----------------------------------------------
+confirm() {
+  local prompt="$1"
+  if [[ "$FORCE" == true ]]; then
+    return 0
+  fi
+  read -r -p "$prompt [yes/no]: " response
+  if [[ "$response" != "yes" ]]; then
+    return 1
+  fi
+  return 0
+}
 
-read -p "Enter the block device to encrypt (e.g., /dev/sdX): " BLOCK_DEVICE
-if [[ ! -b "$BLOCK_DEVICE" ]]; then
-  error_exit "Block device $BLOCK_DEVICE does not exist or is not a valid block device."
+backup_file_if_exists() {
+  local src="$1"
+  if [[ -e "$src" ]]; then
+    run_cmd "mkdir -p '$BACKUP_DIR' && cp -a '$src' '$BACKUP_DIR/'"
+    log INFO "Backed up $src -> $BACKUP_DIR/"
+  else
+    debug "No file to backup: $src"
+  fi
+}
+
+################################################################################
+# Pre-flight checks
+################################################################################
+
+trap 'error_exit "Unexpected error on line $LINENO"' ERR
+
+if [[ $EUID -ne 0 ]]; then
+  error_exit "This script must be run as root. Use sudo or run as root."
 fi
-log "Block device $BLOCK_DEVICE found."
 
-# Check if device is already encrypted
+# Required commands
+REQUIRED_CMDS=(cryptsetup mkfs.ext4 mount blkid)
+for c in "${REQUIRED_CMDS[@]}"; do
+  if ! command -v "$c" &>/dev/null; then
+    error_exit "Required command '$c' not found. Install it before running this script."
+  fi
+done
+
+################################################################################
+# CLI args
+################################################################################
+
+usage() {
+  cat <<-USAGE
+Usage: $0 [--apply] [--yes] [--verbose] [--backup-dir DIR]
+
+Defaults to dry-run. Options:
+  --apply           Apply changes (disable dry-run)
+  --yes, -y         Skip confirmations
+  --verbose, -v     Enable verbose debug output
+  --backup-dir DIR  Use custom backup directory
+  --help, -h        Show this help
+USAGE
+}
+
+while [[ ${#} -gt 0 ]]; do
+  case "$1" in
+    --apply) DRY_RUN=false; shift ;;
+    --yes|-y) FORCE=true; shift ;;
+    --verbose|-v) VERBOSE=true; shift ;;
+    --backup-dir) BACKUP_DIR="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) log WARN "Unknown option: $1"; usage; exit 2 ;;
+  esac
+done
+
+log INFO "LUKS Encryption script starting"
+log INFO "Dry-run: $DRY_RUN, Verbose: $VERBOSE, Force: $FORCE"
+
+################################################################################
+# Operator input: Device and options
+################################################################################
+
+read -r -p "Enter the block device to encrypt (e.g., /dev/sdX): " BLOCK_DEVICE
+if [[ ! -b "$BLOCK_DEVICE" ]]; then
+  error_exit "Block device $BLOCK_DEVICE does not exist or is not a block device."
+fi
+
+# Guard: ensure device is not mounted
+if mount | grep -q "^$BLOCK_DEVICE" || mount | grep -q "/dev/mapper/$MAPPER_NAME"; then
+  error_exit "Device $BLOCK_DEVICE or /dev/mapper/$MAPPER_NAME is already mounted. Unmount first."
+fi
+
+log INFO "Selected block device: $BLOCK_DEVICE"
+
+################################################################################
+# Safety: check for existing LUKS, prompt for re-encrypt
+################################################################################
+
 if cryptsetup isLuks "$BLOCK_DEVICE" &>/dev/null; then
-  log "Block device $BLOCK_DEVICE is already encrypted with LUKS."
-  read -p "Do you want to re-encrypt and erase all data? (yes/no): " reencrypt
-  if [[ "$reencrypt" != "yes" ]]; then
-    error_exit "Operation aborted by user."
+  log WARN "Block device $BLOCK_DEVICE already appears to be LUKS-encrypted."
+  if ! confirm "Do you want to reformat/re-encrypt it and destroy existing data?"; then
+    error_exit "Operator aborted (device already encrypted)."
   fi
 fi
 
-#----------------------------------------------
-# 2. Confirmation: Warning about Data Loss
-#----------------------------------------------
-
-read -p "WARNING: This will erase all data on $BLOCK_DEVICE. Are you sure you want to continue? (yes/no): " confirmation
-if [[ "$confirmation" != "yes" ]]; then
-  error_exit "Operation aborted by user."
+if ! confirm "WARNING: This will ERASE ALL DATA on $BLOCK_DEVICE. Proceed?"; then
+  error_exit "Operator cancelled the operation."
 fi
-log "User confirmed to proceed with encryption."
 
-#----------------------------------------------
-# 3. Prompt for Passphrase and Validation
-#----------------------------------------------
+################################################################################
+# Backup critical files (fstab/crypttab) and create backup directory
+################################################################################
 
-read -s -p "Enter the passphrase for encryption: " passphrase
-echo    # Newline after password input.
-read -s -p "Confirm the passphrase: " confirmPassphrase
-echo    # Newline after confirmation input.
-if [[ "$passphrase" != "$confirmPassphrase" ]]; then
+log INFO "Preparing backup directory: $BACKUP_DIR"
+run_cmd "mkdir -p '$BACKUP_DIR' && chmod 700 '$BACKUP_DIR'"
+for f in "${FILES_TO_BACKUP[@]}"; do
+  backup_file_if_exists "$f"
+done
+
+################################################################################
+# Gather passphrase securely
+################################################################################
+
+read -s -p "Enter passphrase for LUKS (will not be echoed): " passphrase
+echo
+read -s -p "Confirm passphrase: " passphrase_confirm
+echo
+if [[ "$passphrase" != "$passphrase_confirm" ]]; then
   error_exit "Passphrases do not match. Aborting."
 fi
-log "Passphrase confirmed."
+unset passphrase_confirm
 
-#----------------------------------------------
-# 4. Encrypt the Block Device using LUKS
-#----------------------------------------------
+################################################################################
+# Perform encryption, mapping, format, and mount
+################################################################################
 
-log "Encrypting $BLOCK_DEVICE with LUKS..."
-if ! echo -n "$passphrase" | cryptsetup luksFormat --type luks2 "$BLOCK_DEVICE"; then
-  error_exit "Failed to encrypt $BLOCK_DEVICE."
-fi
-log "Encryption of $BLOCK_DEVICE completed."
+ENCRYPT_CMD="echo -n \"$passphrase\" | cryptsetup luksFormat --type luks2 --key-file=- '$BLOCK_DEVICE'"
+run_cmd "$ENCRYPT_CMD"
 
-#----------------------------------------------
-# 5. Open the LUKS Encrypted Device
-#----------------------------------------------
+# Open the LUKS container
+OPEN_CMD="echo -n \"$passphrase\" | cryptsetup open --type luks2 --key-file=- '$BLOCK_DEVICE' '$MAPPER_NAME'"
+run_cmd "$OPEN_CMD"
 
-log "Opening the encrypted device..."
-if [[ -e /dev/mapper/luks ]]; then
-  log "/dev/mapper/luks already exists. Skipping open."
+MAPPED_DEVICE="/dev/mapper/$MAPPER_NAME"
+
+# Format if not already formatted as ext4
+if blkid "$MAPPED_DEVICE" 2>/dev/null | grep -q ext4; then
+  log INFO "Mapped device $MAPPED_DEVICE already has ext4 filesystem. Skipping mkfs."
 else
-  if ! echo -n "$passphrase" | cryptsetup open "$BLOCK_DEVICE" luks; then
-      error_exit "Failed to open the encrypted device."
-  fi
-  log "Encrypted device opened successfully."
+  run_cmd "mkfs.ext4 -F '$MAPPED_DEVICE'"
 fi
 
-#----------------------------------------------
-# 6. Format the Encrypted Device with ext4 Filesystem
-#----------------------------------------------
-
-log "Formatting the encrypted device (/dev/mapper/luks) with ext4 filesystem..."
-if blkid /dev/mapper/luks | grep -q ext4; then
-  log "Encrypted device already formatted with ext4. Skipping format."
+# Ensure mount dir exists and mount
+run_cmd "mkdir -p '$MOUNT_DIR' && chmod 750 '$MOUNT_DIR'"
+if mount | grep -q " $MOUNT_DIR "; then
+  log INFO "Mount point $MOUNT_DIR already in use. Skipping mount."
 else
-  if ! mkfs.ext4 /dev/mapper/luks; then
-      error_exit "Failed to format the encrypted device."
-  fi
-  log "Filesystem formatted successfully."
+  run_cmd "mount '$MAPPED_DEVICE' '$MOUNT_DIR'"
+  log INFO "Mounted $MAPPED_DEVICE at $MOUNT_DIR"
 fi
 
-#----------------------------------------------
-# 7. Mount the Encrypted Device
-#----------------------------------------------
+################################################################################
+# Optional: Persist mapping in /etc/crypttab and /etc/fstab (prompt operator)
+################################################################################
 
-log "Mounting the encrypted device at $MOUNT_DIR..."
-if [[ ! -d "$MOUNT_DIR" ]]; then
-  if ! mkdir -p "$MOUNT_DIR"; then
-      error_exit "Failed to create mount directory $MOUNT_DIR."
+if confirm "Would you like to add entries to /etc/crypttab and /etc/fstab to mount on boot?"; then
+  CRYPTTAB_ENTRY="$MAPPER_NAME $BLOCK_DEVICE none luks"
+  FSTAB_ENTRY="$MAPPED_DEVICE $MOUNT_DIR ext4 defaults 0 2"
+  log INFO "Will append to /etc/crypttab: $CRYPTTAB_ENTRY"
+  log INFO "Will append to /etc/fstab: $FSTAB_ENTRY"
+  if confirm "Apply these changes to /etc/crypttab and /etc/fstab now?"; then
+    run_cmd "cp -a /etc/crypttab '$BACKUP_DIR/crypttab.bak' || true"
+    run_cmd "cp -a /etc/fstab '$BACKUP_DIR/fstab.bak' || true"
+    run_cmd "bash -c 'echo \"$CRYPTTAB_ENTRY\" >> /etc/crypttab'"
+    run_cmd "bash -c 'echo \"$FSTAB_ENTRY\" >> /etc/fstab'"
+    log INFO "Appended crypttab/fstab entries (backups in $BACKUP_DIR)."
+  else
+    log INFO "Skipped writing to crypttab/fstab."
   fi
 fi
-if mount | grep -q "$MOUNT_DIR"; then
-  log "Encrypted device already mounted at $MOUNT_DIR."
-else
-  if ! mount /dev/mapper/luks "$MOUNT_DIR"; then
-      error_exit "Failed to mount the encrypted device."
-  fi
-  log "Encrypted device mounted at $MOUNT_DIR."
+
+################################################################################
+# Final summary and cleanup
+################################################################################
+
+log INFO "LUKS encryption flow complete (or simulated)."
+log INFO "Summary:"
+log INFO " - Block device: $BLOCK_DEVICE"
+log INFO " - Mapper device: $MAPPED_DEVICE"
+log INFO " - Mounted at: $MOUNT_DIR"
+log INFO " - Backup directory: $BACKUP_DIR"
+log INFO " - Log file: $LOG_FILE"
+
+log INFO "To unmount and close the encrypted device:"
+log INFO "  sudo umount $MOUNT_DIR"
+log INFO "  sudo cryptsetup close $MAPPER_NAME"
+
+if [[ "$DRY_RUN" == true ]]; then
+  log INFO "Dry-run was enabled. Re-run with --apply to perform changes."
 fi
 
-#----------------------------------------------
-# Final Instructions and Success Message
-#----------------------------------------------
-
-log "LUKS encryption has been successfully applied to $BLOCK_DEVICE and mounted at $MOUNT_DIR."
-log "Summary:"
-log "- Block device: $BLOCK_DEVICE"
-log "- Mount point: $MOUNT_DIR"
-log "- Mapper device: /dev/mapper/luks"
-log "Next steps:"
-log "- To unmount: sudo umount $MOUNT_DIR"
-log "- To close:   sudo cryptsetup close luks"
+log INFO "Script finished."

@@ -1,176 +1,264 @@
-#!/bin/bash
-#===============================================================================
-# Script Name: install_openshift.sh
+#!/usr/bin/env bash
 #
-# Description:
-#   This script installs and configures the OpenShift client (oc) on a Linux system.
-#   It downloads a specified version of the OpenShift client, extracts it to a chosen 
-#   installation directory, adds the directory to your PATH, logs into an OpenShift cluster 
-#   as the cluster admin, creates a new project, and deploys a sample application.
+# OpenShift Client Install & Project Bootstrap (Enterprise-ready)
+# - Idempotent, documented, and safe by default (dry-run).
+# - Use --apply to perform changes. Supports --verbose and --yes to skip prompts.
 #
-# Prerequisites:
-#   - This script must be run on a system with a supported Linux distribution (Ubuntu/Debian).
-#   - The OpenShift CLI (oc) must not be pre-installed, or you wish to update it.
-#   - Internet connectivity is required for downloading the OpenShift client.
-#   - Sudo privileges are needed for directory creation, file extraction, etc.
-#
-# Usage:
-#   sudo ./install_openshift.sh
-#
-# Disclaimer:
-#   This script is provided "as is" without warranty of any kind. Use at your own risk.
-#
-# Author: Your Name or Organization
-# Date:   2025-04-14
-# Version: 1.1
-#===============================================================================
-
-# Exit immediately if a command exits with a non-zero status,
-# an undefined variable is used, or any command in a pipeline fails.
+# Notes:
+# - This script installs or updates the OpenShift client (oc) and optionally
+#   creates a project and deploys a sample app. Replace placeholders for production use.
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# Trap unexpected errors
-trap 'error_exit "Unexpected error occurred on line $LINENO."' ERR
+################################################################################
+# Defaults and configuration (tune for your environment)
+################################################################################
 
-# Ensure script is run as root
-if [[ $EUID -ne 0 ]]; then
-  echo "This script must be run as root. Use sudo or run as root." >&2
-  exit 1
-fi
+# Operational flags
+DRY_RUN=true
+VERBOSE=false
+FORCE=false
 
-#----------------------------------------------
-# Variables
-#----------------------------------------------
-OCP_VERSION="4.9.0"                                 # Desired OpenShift version
-INSTALL_DIR="/opt/openshift"                        # Directory to install the OpenShift client
-PROJECT_NAME="myproject"                            # Name of the new OpenShift project to create
-SAMPLE_APP="openshift/deployment-example"           # Sample application image to deploy
-LOG_FILE="/var/log/openshift_install.log"           # Log file for script output
+# Primary settings
+OCP_VERSION="4.12.0"
+INSTALL_DIR="/opt/openshift"
+PROJECT_NAME="myproject"
+SAMPLE_APP_IMAGE="openshift/deployment-example"
+LOG_FILE="/var/log/openshift_install.log"
+BACKUP_DIR="/var/tmp/openshift-backup-$(date +%Y%m%d%H%M%S)"
 
-#----------------------------------------------
-# Functions
-#----------------------------------------------
-# log: Outputs informational messages along with a timestamp.
-function log() {
-  local message="$1"
-  echo -e "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $message"
-  echo -e "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $message" >> "$LOG_FILE"
+# Location to copy 'oc' for system-wide usage
+OC_SYMLINK="/usr/local/bin/oc"
+
+################################################################################
+# Helper functions
+################################################################################
+
+log() {
+  local level="INFO"
+  if [[ "$1" =~ ^(DEBUG|INFO|WARN|ERROR)$ ]]; then
+    level="$1"; shift
+  fi
+  printf '[%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*"
+  mkdir -p "$(dirname "$LOG_FILE")" || true
+  printf '%s %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-# error_exit: Outputs an error message, writes it to stderr and the log file, then exits.
-function error_exit() {
-  local message="$1"
-  echo -e "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $message" >&2
-  echo -e "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $message" >> "$LOG_FILE"
+debug() { [[ "$VERBOSE" == true ]] && log DEBUG "$*"; }
+
+error_exit() {
+  log ERROR "$*"
   exit 1
 }
 
-#----------------------------------------------
-# 1. Pre-flight Check: Ensure 'oc' CLI is not already installed (or update as necessary)
-#----------------------------------------------
-
-log "Checking for OpenShift CLI (oc)..."
-if command -v oc &>/dev/null; then
-  INSTALLED_VERSION=$(oc version --client | grep -oP 'Client Version: \K[0-9.]+')
-  if [[ "$INSTALLED_VERSION" == "$OCP_VERSION" ]]; then
-    log "OpenShift CLI version $OCP_VERSION is already installed. Skipping download."
+run_cmd() {
+  if [[ "$VERBOSE" == true ]]; then
+    log DEBUG "+ $*"
+  fi
+  if [[ "$DRY_RUN" == true ]]; then
+    log INFO "DRY-RUN: $*"
   else
-    log "OpenShift CLI is installed (version $INSTALLED_VERSION), updating to $OCP_VERSION."
+    eval "$*"
   fi
-else
-  log "OpenShift CLI not found. Proceeding with installation."
+}
+
+confirm() {
+  local prompt="$1"
+  if [[ "$FORCE" == true ]]; then
+    return 0
+  fi
+  read -r -p "$prompt [yes/no]: " response
+  if [[ "$response" != "yes" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+backup_file_if_exists() {
+  local src="$1"
+  if [[ -e "$src" ]]; then
+    run_cmd "mkdir -p '$BACKUP_DIR' && cp -a '$src' '$BACKUP_DIR/'"
+    log INFO "Backed up $src -> $BACKUP_DIR/"
+  else
+    debug "No file to backup: $src"
+  fi
+}
+
+################################################################################
+# Pre-flight checks
+################################################################################
+
+trap 'error_exit "Unexpected error on line $LINENO"' ERR
+
+if [[ $EUID -ne 0 ]]; then
+  error_exit "This script must be run as root. Use sudo or run as root."
 fi
 
-#----------------------------------------------
-# 2. Create Installation Directory
-#----------------------------------------------
+REQUIRED_TOOLS=(wget tar)
+for t in "${REQUIRED_TOOLS[@]}"; do
+  if ! command -v "$t" &>/dev/null; then
+    error_exit "Required tool '$t' not found. Install it and retry."
+  fi
+done
 
-log "Creating installation directory at '$INSTALL_DIR'..."
-if [[ ! -d "$INSTALL_DIR" ]]; then
-  if ! mkdir -p "$INSTALL_DIR"; then
-    error_exit "Failed to create directory '$INSTALL_DIR'."
+################################################################################
+# CLI args
+################################################################################
+
+usage() {
+  cat <<-USAGE
+Usage: $0 [--apply] [--yes] [--verbose] [--install-dir DIR] [--version VER]
+
+Defaults to dry-run. Options:
+  --apply             Apply changes (disable dry-run)
+  --yes, -y           Skip confirmations
+  --verbose, -v       Enable verbose debug output
+  --install-dir DIR   Override OpenShift client install directory
+  --version VER       Specify OpenShift client version to install
+  --help, -h          Show this help message
+USAGE
+}
+
+while [[ ${#} -gt 0 ]]; do
+  case "$1" in
+    --apply) DRY_RUN=false; shift ;;
+    --yes|-y) FORCE=true; shift ;;
+    --verbose|-v) VERBOSE=true; shift ;;
+    --install-dir) INSTALL_DIR="$2"; shift 2 ;;
+    --version) OCP_VERSION="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) log WARN "Unknown option: $1"; usage; exit 2 ;;
+  esac
+done
+
+log INFO "OpenShift client installer starting"
+log INFO "Dry-run: $DRY_RUN, Verbose: $VERBOSE, Force: $FORCE"
+
+################################################################################
+# Backup existing oc and PATH settings
+################################################################################
+
+log INFO "Preparing backup directory: $BACKUP_DIR"
+run_cmd "mkdir -p '$BACKUP_DIR' && chmod 700 '$BACKUP_DIR'"
+backup_file_if_exists "$OC_SYMLINK"
+
+################################################################################
+# Ensure install directory exists and is writable
+################################################################################
+
+log INFO "Ensuring install directory: $INSTALL_DIR"
+run_cmd "mkdir -p '$INSTALL_DIR' && chmod 755 '$INSTALL_DIR'"
+
+################################################################################
+# Determine existing oc installation and version (if any)
+################################################################################
+
+INSTALLED_OC=""
+INSTALLED_VERSION=""
+if command -v oc &>/dev/null; then
+  INSTALLED_OC=$(command -v oc)
+  if oc version --client &>/dev/null; then
+    INSTALLED_VERSION=$(oc version --client | sed -n 's/.*Client Version:\s*//p' | tr -d ',')
   fi
-  if ! chown "$(whoami):$(whoami)" "$INSTALL_DIR"; then
-    error_exit "Failed to set ownership of '$INSTALL_DIR'."
-  fi
-else
-  log "Installation directory '$INSTALL_DIR' already exists."
+  log INFO "Found existing 'oc' at: ${INSTALLED_OC} (version: ${INSTALLED_VERSION:-unknown})"
 fi
 
-#----------------------------------------------
-# 3. Download and Extract OpenShift Client
-#----------------------------------------------
+################################################################################
+# Download and extract oc if needed
+################################################################################
 
-ISO_FILE="/tmp/openshift-client-linux-$OCP_VERSION.tar.gz"
-if ! command -v oc &>/dev/null || [[ "$INSTALLED_VERSION" != "$OCP_VERSION" ]]; then
-  log "Downloading OpenShift client version $OCP_VERSION..."
-  if ! wget -q "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/$OCP_VERSION/openshift-client-linux-$OCP_VERSION.tar.gz" -O "$ISO_FILE"; then
-    error_exit "Failed to download OpenShift client."
+OC_TARBALL="/tmp/openshift-client-linux-${OCP_VERSION}.tar.gz"
+OC_DOWNLOAD_URL="https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OCP_VERSION}/openshift-client-linux-${OCP_VERSION}.tar.gz"
+
+if [[ -z "$INSTALLED_VERSION" || "$INSTALLED_VERSION" != "$OCP_VERSION" ]]; then
+  log INFO "Downloading OpenShift client version $OCP_VERSION from $OC_DOWNLOAD_URL"
+  run_cmd "wget -q -O '$OC_TARBALL' '$OC_DOWNLOAD_URL'"
+  log INFO "Extracting tarball to $INSTALL_DIR"
+  run_cmd "tar -xzf '$OC_TARBALL' -C '$INSTALL_DIR'"
+
+  # Ensure executable installed and optionally symlink into /usr/local/bin
+  if [[ -x "$INSTALL_DIR/oc" ]]; then
+    log INFO "oc binary extracted at $INSTALL_DIR/oc"
+    if [[ ! -e "$OC_SYMLINK" ]]; then
+      log INFO "Creating symlink $OC_SYMLINK -> $INSTALL_DIR/oc"
+      run_cmd "ln -s '$INSTALL_DIR/oc' '$OC_SYMLINK'"
+    else
+      log INFO "$OC_SYMLINK already exists; skipping symlink creation."
+    fi
+  else
+    error_exit "oc binary not found after extraction. Check tarball contents."
   fi
-  log "Extracting OpenShift client to '$INSTALL_DIR'..."
-  if ! tar -zxvf "$ISO_FILE" -C "$INSTALL_DIR"; then
-    error_exit "Failed to extract OpenShift client."
-  fi
-  export PATH="$PATH:$INSTALL_DIR"
-  log "OpenShift CLI installed/updated successfully."
 else
-  log "OpenShift CLI version $OCP_VERSION already present."
+  log INFO "Required oc version $OCP_VERSION already installed. Skipping download."
 fi
 
-#----------------------------------------------
-# 4. Login as Cluster Admin
-#----------------------------------------------
+################################################################################
+# Login to OpenShift cluster as cluster admin (if possible)
+################################################################################
 
-log "Logging in as cluster admin..."
-if ! oc whoami &>/dev/null; then
-  if ! oc login -u system:admin &>/dev/null; then
-    error_exit "Failed to log in as system:admin. Ensure your OpenShift cluster is up and accessible."
+log INFO "Verifying OpenShift cluster access"
+if command -v oc &>/dev/null; then
+  if oc whoami &>/dev/null; then
+    log INFO "Already logged in as: $(oc whoami)"
+  else
+    log INFO "Attempting to login as 'system:admin' (requires local cluster admin credentials)"
+    if ! oc login -u system:admin &>/dev/null; then
+      log WARN "Failed to login as system:admin. Cluster may be unreachable or credentials unavailable. Skipping cluster operations."
+      SKIP_CLUSTER_OPS=true
+    else
+      SKIP_CLUSTER_OPS=false
+      log INFO "Successfully logged in as system:admin"
+    fi
   fi
-  log "Logged in successfully."
 else
-  log "Already logged in as $(oc whoami)."
+  error_exit "oc binary not available; cannot perform cluster operations."
 fi
 
-#----------------------------------------------
-# 5. Create a New Project
-#----------------------------------------------
+################################################################################
+# Create project and deploy sample app (cluster operations)
+################################################################################
 
-log "Creating new OpenShift project: '$PROJECT_NAME'..."
-if oc get project "$PROJECT_NAME" &>/dev/null; then
-  log "Project '$PROJECT_NAME' already exists. Skipping creation."
+if [[ "${SKIP_CLUSTER_OPS:-true}" == true ]]; then
+  log WARN "Skipping project creation and app deployment due to lack of cluster access."
 else
-  if ! oc new-project "$PROJECT_NAME" &>/dev/null; then
-    error_exit "Failed to create project '$PROJECT_NAME'. Ensure you have the required permissions."
+  log INFO "Creating OpenShift project: $PROJECT_NAME"
+  if oc get project "$PROJECT_NAME" &>/dev/null; then
+    log INFO "Project $PROJECT_NAME already exists."
+  else
+    run_cmd "oc new-project '$PROJECT_NAME'"
+    log INFO "Project '$PROJECT_NAME' created."
   fi
-  log "Project '$PROJECT_NAME' created successfully."
+
+  log INFO "Deploying sample app: $SAMPLE_APP_IMAGE"
+  if oc get all -n "$PROJECT_NAME" | grep -q "$SAMPLE_APP_IMAGE"; then
+    log INFO "Sample app already present in project $PROJECT_NAME."
+  else
+    run_cmd "oc new-app '$SAMPLE_APP_IMAGE' -n '$PROJECT_NAME'"
+    log INFO "Sample app deployment requested."
+  fi
 fi
 
-#----------------------------------------------
-# 6. Deploy a Sample Application
-#----------------------------------------------
+################################################################################
+# Summary and next steps
+################################################################################
 
-log "Deploying sample application '$SAMPLE_APP'..."
-if oc get all -n "$PROJECT_NAME" | grep -q "$SAMPLE_APP"; then
-  log "Sample application '$SAMPLE_APP' already deployed in project '$PROJECT_NAME'."
+log INFO "OpenShift client install and bootstrap completed (or simulated)."
+log INFO "Summary:"
+log INFO " - oc version desired: $OCP_VERSION"
+log INFO " - Install dir: $INSTALL_DIR"
+log INFO " - Symlink: $OC_SYMLINK"
+log INFO " - Backup dir: $BACKUP_DIR"
+log INFO " - Log file: $LOG_FILE"
+
+if [[ "${SKIP_CLUSTER_OPS:-true}" == true ]]; then
+  log INFO "Cluster operations were skipped. Ensure you have network access and credentials to the cluster and re-run with --apply when ready."
 else
-  if ! oc new-app "$SAMPLE_APP" &>/dev/null; then
-    error_exit "Failed to deploy sample application '$SAMPLE_APP'. Ensure the image exists and is accessible."
-  fi
-  log "Sample application deployed successfully."
+  log INFO "Cluster operations completed or requested. Validate project and deployments with: oc get all -n $PROJECT_NAME"
 fi
 
-#----------------------------------------------
-# 7. Final Notification
-#----------------------------------------------
+if [[ "$DRY_RUN" == true ]]; then
+  log INFO "Dry-run was enabled. Re-run with --apply to make changes."
+fi
 
-log "OpenShift installation and configuration completed successfully."
-log "Summary:"
-log "- OpenShift CLI version $OCP_VERSION installed in $INSTALL_DIR."
-log "- Logged in as $(oc whoami)."
-log "- Project '$PROJECT_NAME' is ready."
-log "- Sample application '$SAMPLE_APP' deployed."
-log "Next steps:"
-log "- Use 'oc get all -n $PROJECT_NAME' to view resources."
-log "- Access your OpenShift cluster and application as needed."
+log INFO "Script finished."
